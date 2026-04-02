@@ -24,7 +24,11 @@ from itertools import tee
 #import lxml
 import traceback
 import contextlib
-from rcsbsearchapi.search import Query, SequenceQuery
+try:
+    from rcsbsearchapi.search import Query, SequenceQuery
+    _rcsbsearchapi_available = True
+except Exception:
+    _rcsbsearchapi_available = False
 from Bio import AlignIO
 from Bio import SeqIO
 from Bio import Seq
@@ -206,6 +210,11 @@ def parse_relevant_search_metadata(sample_seq_list, header_pdb_dict):
 #building sequence search query with set parameters and begin search. cast results to list.
 #([str,str,int], str) -> []
 def search_pdb_for_sequences(seq, aln_file_path, identity_cutoff):
+
+    if not _rcsbsearchapi_available:
+        errMsg = "rcsbsearchapi is not available (import failed). Cannot perform sequence search."
+        errorFct(errMsg)
+        return []
 
     raw_response_list = []
     result_list = []
@@ -2109,7 +2118,7 @@ def clean_fasta_file(aln_file_full_path, out_file_full_path, verbosity):
         errorFct(errMsg)
         exit(1)
     try:
-        records = AlignIO.read(aln_file_handle, "fasta")
+        records = list(SeqIO.parse(aln_file_handle, "fasta"))
     except:
         errMsg = "Could not read fasta file %s." % aln_file_full_path
         close_file_safely(aln_file_handle, aln_file_full_path, errMsg)
@@ -4275,6 +4284,114 @@ def transform_alignment(fasta_file_full_path, output_file_full_path):
     
     SeqIO.write(alignment, output_file_full_path, "fasta")
 
+#maps a single input FASTA to PDB files based on exact DIAMOND matches against the PDB-derived database.
+#writes per-sequence filter statistics to <out_path>/<fasta_name>_filter_stats.tsv and copies matching
+#PDB files (as .ent.gz) to <out_path>/PDB/.
+#failure reasons:
+#  no_diamond_hit  - no DIAMOND hit at all for this sequence
+#  no_exact_match  - DIAMOND hit exists but fails exact-match filter (0 mismatches, 0 gaps, full length)
+# void (str, str, str, str, str, int, float, int, str, str, int)
+def map_fasta_to_pdb(fasta_file_full_path, out_path, diamond_exe_full_path, diamond_db_file_full_path,
+                     loc_pdb_db_path, verbosity, diamond_block_size, diamond_threads,
+                     diamond_tmp_dir, diamond_mp_tmp_dir, diamond_mp):
+
+    create_dir_safely(out_path)
+    fasta_name = os.path.splitext(os.path.basename(fasta_file_full_path))[0]
+
+    # clean input FASTA (strip gaps and non-alphabet characters)
+    clean_fasta_full_path = os.path.join(out_path, fasta_name + "_cleaned.fasta")
+    clean_fasta_file(fasta_file_full_path, clean_fasta_full_path, verbosity)
+
+    # import sequence list: [gapped_seq, header, entry_number, ungapped_seq]
+    aln_entry_list = import_seq_list_from_fasta_aln(fasta_file_full_path)
+    total_count = len(aln_entry_list)
+    if verbosity > 0:
+        print("Total sequences in input: %d" % total_count)
+
+    # run DIAMOND blastp
+    TSV_full_path = os.path.join(out_path, fasta_name + "_diamond.tsv")
+    diamond_blastp_query(diamond_exe_full_path, diamond_db_file_full_path, clean_fasta_full_path,
+                         TSV_full_path, verbosity, diamond_block_size, diamond_threads,
+                         diamond_tmp_dir, diamond_mp_tmp_dir, diamond_mp)
+
+    # collect best raw DIAMOND hit per header (for reporting on sequences that fail the exact-match filter)
+    best_raw_hit = {}
+    try:
+        raw_df = pandas.read_csv(TSV_full_path, sep='\t')
+        for index, row in raw_df.iterrows():
+            qseqid = str(row.qseqid)
+            if qseqid not in best_raw_hit:
+                best_raw_hit[qseqid] = row
+            else:
+                if float(row.bitscore) > float(best_raw_hit[qseqid].bitscore):
+                    best_raw_hit[qseqid] = row
+    except Exception:
+        pass
+
+    # apply exact-match filter and resolve multi-hit ambivalences
+    exact_match_dict = get_exact_matches(TSV_full_path, aln_entry_list)
+    unique_exact_match_dict = resolve_ambivalences(exact_match_dict, fasta_file_full_path)
+
+    # build per-sequence statistics and collect chain IDs for PDB copying
+    stat_rows = []
+    passed_chain_list = []
+    for entry in aln_entry_list:
+        header = entry[1]
+        row_stat = {"fasta_header": header}
+        if len(unique_exact_match_dict[header]) == 1:
+            match = unique_exact_match_dict[header][0]
+            row_stat["status"] = "passed"
+            row_stat["fail_reason"] = ""
+            row_stat["chain_id"] = match.sseqid
+            row_stat["sstart"] = match.sstart
+            row_stat["send"] = match.send
+            row_stat["pident"] = match.pident
+            row_stat["evalue"] = match.evalue
+            row_stat["bitscore"] = match.bitscore
+            passed_chain_list.append(str(match.sseqid))
+        else:
+            if header in best_raw_hit:
+                fail_reason = "no_exact_match"
+                best = best_raw_hit[header]
+                row_stat["pident"] = best.pident
+                row_stat["evalue"] = best.evalue
+                row_stat["bitscore"] = best.bitscore
+            else:
+                fail_reason = "no_diamond_hit"
+                row_stat["pident"] = ""
+                row_stat["evalue"] = ""
+                row_stat["bitscore"] = ""
+            row_stat["status"] = "failed"
+            row_stat["fail_reason"] = fail_reason
+            row_stat["chain_id"] = ""
+            row_stat["sstart"] = ""
+            row_stat["send"] = ""
+        stat_rows.append(row_stat)
+
+    # write filter statistics TSV
+    stats_full_path = os.path.join(out_path, fasta_name + "_filter_stats.tsv")
+    stats_df = pandas.DataFrame(stat_rows, columns=["fasta_header", "status", "fail_reason",
+                                                     "chain_id", "sstart", "send",
+                                                     "pident", "evalue", "bitscore"])
+    stats_df.to_csv(stats_full_path, sep='\t', index=False)
+
+    # print summary
+    passed_count = sum(1 for r in stat_rows if r["status"] == "passed")
+    no_hit_count = sum(1 for r in stat_rows if r["fail_reason"] == "no_diamond_hit")
+    no_exact_count = sum(1 for r in stat_rows if r["fail_reason"] == "no_exact_match")
+    if verbosity > 0:
+        print("Passed (exact PDB match found):  %d / %d" % (passed_count, total_count))
+        print("Failed - no DIAMOND hit:         %d / %d" % (no_hit_count, total_count))
+        print("Failed - hit but not exact match: %d / %d" % (no_exact_count, total_count))
+        print("Filter statistics written to: %s" % stats_full_path)
+
+    # copy matching PDB files to <out_path>/PDB/
+    pdb_out_path = os.path.join(out_path, "PDB")
+    create_dir_safely(pdb_out_path)
+    cp_PDB_files_to_job_dir(passed_chain_list, loc_pdb_db_path, pdb_out_path)
+    if verbosity > 0:
+        print("PDB files written to: %s" % pdb_out_path)
+
 def main():
 
     tic = time.perf_counter()
@@ -4321,6 +4438,11 @@ def main():
     argParser.add_argument("-mpi", "--mpibin", default = "", help="Provide path to \"openmpi/bin\" path.", required=False)
     argParser.add_argument("-bl", "--baseline", default=1, action="count", help="Provide this flag to use a random alignment as baseline score.", required=False)
 
+    argParser.add_argument("-gp", "--getpdb", default=0, action="count",
+                           help="Map input FASTA (--alignmentfile) to PDB files. Writes per-sequence filter statistics "
+                                "to <outputdir>/<name>_filter_stats.tsv and copies matched PDB files to <outputdir>/PDB/. "
+                                "Requires --alignmentfile, --outputdir, --diamondfile, --diamonddbfile, --locpdbdb.",
+                           required=False)
     argParser.add_argument("-t", "--test", default=0, action="count", help="Testing ", required=False)
 
     args = argParser.parse_args()
@@ -4364,6 +4486,10 @@ def main():
                 args.compstratname, args.compstratfile, args.continuejob, args.backupfreq)
     if args.evaljob > 0:
         evaluate_job(args.outputdir, args.jobname, args.verbose)
+    if args.getpdb > 0:
+        map_fasta_to_pdb(args.alignmentfile, args.outputdir, args.diamondfile, args.diamonddbfile,
+                         args.locpdbdb, args.verbose, args.diamondblocksize, args.threads,
+                         args.diamondtmpdir, args.diamondmptmpdir, args.diamondmp)
     if args.test > 0:
         #test_SPS(args.alignmentfile)
         #test_duplicate_clean_seq(args.alignmentfile)
