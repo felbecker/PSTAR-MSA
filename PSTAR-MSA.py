@@ -2977,7 +2977,7 @@ def write_baseline_aln_file(aln_file_full_path_list, job_path, verbosity):
             errorFct(errMsg)
             exit(1)
         try:
-            records = AlignIO.read(aln_file_handle, "fasta")
+            records = list(SeqIO.parse(aln_file_handle, "fasta"))
         except:
             errMsg = "Could not read fasta file %s." % aln_file_full_path
             close_file_safely(aln_file_handle, aln_file_full_path, errMsg)
@@ -4391,6 +4391,19 @@ def map_fasta_to_pdb(fasta_file_full_path, out_path, diamond_exe_full_path, diam
     cp_PDB_files_to_job_dir(passed_chain_list, loc_pdb_db_path, pdb_out_path)
     if verbosity > 0:
         print("PDB files written to: %s" % pdb_out_path)
+
+def initialize(alphabet="AA"):
+    """Initialize globals required for programmatic use.
+
+    Unlike main(), this does NOT call os.chdir(), so all paths passed to
+    map_fasta_to_pdb() are resolved relative to the caller's working directory.
+    Call this once before using map_fasta_to_pdb() directly.
+    """
+    global SCRIPT_DIR, CLEAN_SEQ_REGEX_STR
+    SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+    valid_symbols = sel_alphabet(alphabet)
+    CLEAN_SEQ_REGEX_STR = build_regex_for_seq_cleaning_whitelist(valid_symbols)
+
 
 def main():
 
